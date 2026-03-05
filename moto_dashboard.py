@@ -291,7 +291,9 @@ def parse_time_col(series):
         try:
             dt = pd.to_datetime(series, format=fmt)
             s  = (dt - dt.iloc[0]).dt.total_seconds().values
-            return np.where(s<0, s+86400, s), str(dt.iloc[0].time())
+            # Store start time as HH:MM:SS only (no microseconds)
+            hms = dt.iloc[0].strftime("%H:%M:%S")
+            return np.where(s<0, s+86400, s), hms
         except: pass
     try:
         dt = pd.to_datetime(series, infer_datetime_format=True)
@@ -1232,16 +1234,26 @@ def page_upload():
     if ok:
         if not name: st.error("Session name required."); return
         if f is None: st.error("Select a CSV file."); return
-        with st.spinner("Parsing…"):
-            df, start_hms = parse_csv(f.read())
-            df = derive(df)
-            dur = float(df["t"].max())
-            save_db(dict(name=name,date=str(date),rider=rider,track=track,weather=weather,
-                notes=notes,firmware=firmware,config=config,ambient_temp=float(ambient_t),
-                upload_time=datetime.now().isoformat(),row_count=len(df),
-                duration_s=dur,start_hms=start_hms), df)
-            bust()
-        st.success(f"✅ '{name}' saved — {len(df):,} rows · {dur:.0f}s ({dur/60:.1f} min) · Start {start_hms}")
+        with st.spinner("Parsing and uploading…"):
+            try:
+                df, start_hms = parse_csv(f.read())
+                df = derive(df)
+                dur = float(df["t"].max()) if df["t"].notna().any() else 0.0
+                sid = save_db(dict(name=name,date=str(date),rider=rider,track=track,weather=weather,
+                    notes=notes,firmware=firmware,config=config,ambient_temp=float(ambient_t),
+                    upload_time=datetime.now().isoformat(),row_count=len(df),
+                    duration_s=dur,start_hms=start_hms), df)
+                bust()
+                # Verify rows actually landed
+                with get_engine().connect() as con:
+                    res = con.execute(text("SELECT COUNT(*) FROM signals WHERE session_id=:s"), {"s": sid})
+                    actual_rows = res.fetchone()[0]
+                if actual_rows == 0:
+                    st.error(f"❌ Upload failed: 0 rows written to database for session ID {sid}. Check the CSV format and try again.")
+                else:
+                    st.success(f"✅ **'{name}'** saved · {actual_rows:,} rows · {dur:.0f}s ({dur/60:.1f} min) · Start {start_hms}")
+            except Exception as e:
+                st.error(f"❌ Upload error: {e}")
 
 def page_sessions():
     shdr("SESSION LIBRARY")
@@ -1278,12 +1290,24 @@ def page_analyse(thr):
     opts = {f'{r["name"]}  [{r["date"]}]': (int(r["id"]), r) for _,r in sess.iterrows()}
     label = st.selectbox("Select session", list(opts.keys()))
     sid, srow = opts[label]
-    df = derive(load_signals(sid))
-    if df.empty or "t" not in df.columns:
-        st.warning("No signal data found for this session. It may have been uploaded with an incompatible CSV format.")
+    load_signals.clear()  # always fresh — never serve a stale cached empty df
+    raw_df = load_signals(sid)
+    df = derive(raw_df)
+
+    # Robust guard: empty OR t column missing OR t all-NaN
+    if raw_df.empty or "t" not in raw_df.columns or raw_df["t"].notna().sum() == 0:
+        n_rows = len(raw_df)
+        st.error(
+            f"**No signal data found for session ID {sid}** ({n_rows} rows in database).\n\n"
+            "This usually means the session was uploaded before a bug fix. "
+            "Please **delete this session** from the Sessions page and **re-upload the CSV**.")
         return
+
     raw_hms = srow.get("start_hms")
-    start_hms = str(raw_hms) if raw_hms and str(raw_hms) not in ("nan","None","") else "00:00:00"
+    # Handle microseconds format like "19:07:33.553000" — strip to HH:MM:SS
+    shms_str = str(raw_hms) if raw_hms and str(raw_hms) not in ("nan","None","") else "00:00:00"
+    # Keep only HH:MM:SS (drop microseconds if present)
+    start_hms = ":".join(shms_str.split(":")[:3])
 
     tabs = st.tabs(["📊 Overview","⚙️ Powertrain","🔋 Battery","🌡️ Thermal","🔴 Faults","🗺️ Route","🤖 AI"])
     with tabs[0]: tab_overview(df, start_hms, thr)
