@@ -360,17 +360,35 @@ def _get_columns(table):
             "WHERE table_name = :t"), {"t": table})
         return {row[0] for row in res}
 
+# All columns the signals table should have
+_ALL_SIG_COLS = ["t","throttle","speed_rpm","speed_kmh","brake","torque_nm",
+                 "soc_bms1","soc_bms2","volt_mcu","volt_bms1","volt_bms2",
+                 "curr_mcu","curr_bms1","curr_bms2","motor_temp","mcu_temp",
+                 "board_temp_bms1","board_temp_bms2","mcu_errors","bms1_errors","bms2_errors","lat","lon"]
+_TEXT_SIG_COLS = {"mcu_errors","bms1_errors","bms2_errors"}
+
+def _ensure_sig_cols():
+    """Add any missing columns to the signals table (idempotent)."""
+    existing = _get_columns("signals")
+    type_map = {"lat":"REAL","lon":"REAL","mcu_errors":"TEXT","bms1_errors":"TEXT","bms2_errors":"TEXT"}
+    for col in _ALL_SIG_COLS:
+        if col not in existing:
+            dtype = type_map.get(col, "REAL")
+            _ddl(f"ALTER TABLE signals ADD COLUMN IF NOT EXISTS {col} {dtype}")
+
 def save_db(meta, df):
-    SIG_COLS = ["t","throttle","speed_rpm","speed_kmh","brake","torque_nm",
-                "soc_bms1","soc_bms2","volt_mcu","volt_bms1","volt_bms2",
-                "curr_mcu","curr_bms1","curr_bms2","motor_temp","mcu_temp",
-                "board_temp_bms1","board_temp_bms2","mcu_errors","bms1_errors","bms2_errors","lat","lon"]
-    for c in SIG_COLS:
+    # Ensure signals table has all expected columns before writing
+    _ensure_sig_cols()
+    sig_cols_db = _get_columns("signals") - {"session_id"}
+    # Only insert columns that exist in both our data and the live DB
+    use_cols = [c for c in _ALL_SIG_COLS if c in sig_cols_db]
+
+    for c in use_cols:
         if c not in df.columns: df[c] = np.nan
 
     eng = get_engine()
 
-    # ── 1. Insert session row (dynamic — only columns that exist in live DB) ──
+    # ── 1. Insert session row ─────────────────────────────────────────────────
     session_cols_db = _get_columns("sessions")
     wanted = ["name","date","rider","track","weather","notes","firmware","config",
               "ambient_temp","upload_time","row_count","duration_s","start_hms"]
@@ -378,30 +396,26 @@ def save_db(meta, df):
         _ddl("ALTER TABLE sessions ADD COLUMN start_hms TEXT")
         session_cols_db.add("start_hms")
     insert_cols = [c for c in wanted if c in session_cols_db]
-    col_sql  = ", ".join(insert_cols)
-    val_sql  = ", ".join(f":{c}" for c in insert_cols)
-    meta_clean = {k: v for k, v in meta.items() if k in insert_cols}
+    meta_clean  = {k: v for k, v in meta.items() if k in insert_cols}
 
     with eng.connect() as con:
+        col_sql = ", ".join(insert_cols)
+        val_sql = ", ".join(f":{c}" for c in insert_cols)
         r   = con.execute(text(f"INSERT INTO sessions({col_sql}) VALUES({val_sql}) RETURNING id"), meta_clean)
         sid = r.fetchone()[0]
         con.commit()
 
-    # ── 2. Insert signals via pandas to_sql (executemany — no param-count limit) ──
-    sig = df[SIG_COLS].copy()
+    # ── 2. Insert signals — only columns confirmed in live DB ─────────────────
+    sig = df[use_cols].copy()
     sig.insert(0, "session_id", sid)
 
-    # Cast all numeric columns to native Python float so psycopg2 handles NULL correctly
     for c in sig.columns:
-        if c in ("mcu_errors","bms1_errors","bms2_errors"):
-            sig[c] = sig[c].astype(str).where(sig[c].notna(), other=None)
+        if c in _TEXT_SIG_COLS:
+            sig[c] = sig[c].where(pd.notna(sig[c]), other=None).astype(object)
         else:
             sig[c] = pd.to_numeric(sig[c], errors="coerce")
 
-    # to_sql without method="multi" → DBAPI executemany: one row at a time,
-    # zero parameter-count issues, works on every Postgres/Supabase setup.
     sig.to_sql("signals", eng, if_exists="append", index=False, chunksize=500)
-
     return sid
 
 # ── Derived metrics ───────────────────────────────────────────────────────────
@@ -1212,21 +1226,19 @@ def tab_ai(df, start_hms, srow, thr):
 # STATIC PAGES
 # ═══════════════════════════════════════════════════════════════════════════════
 def _repair_signals(sid, df):
-    """Write signals for an existing session that has 0 rows (re-upload repair)."""
-    SIG_COLS = ["t","throttle","speed_rpm","speed_kmh","brake","torque_nm",
-                "soc_bms1","soc_bms2","volt_mcu","volt_bms1","volt_bms2",
-                "curr_mcu","curr_bms1","curr_bms2","motor_temp","mcu_temp",
-                "board_temp_bms1","board_temp_bms2","mcu_errors","bms1_errors","bms2_errors","lat","lon"]
-    for c in SIG_COLS:
+    """Write signals for an existing session (re-upload repair). Schema-adaptive."""
+    _ensure_sig_cols()
+    sig_cols_db = _get_columns("signals") - {"session_id"}
+    use_cols = [c for c in _ALL_SIG_COLS if c in sig_cols_db]
+    for c in use_cols:
         if c not in df.columns: df[c] = np.nan
-    sig = df[SIG_COLS].copy()
+    sig = df[use_cols].copy()
     sig.insert(0, "session_id", sid)
     for c in sig.columns:
-        if c in ("mcu_errors","bms1_errors","bms2_errors"):
-            sig[c] = sig[c].astype(str).where(sig[c].notna(), other=None)
+        if c in _TEXT_SIG_COLS:
+            sig[c] = sig[c].where(pd.notna(sig[c]), other=None).astype(object)
         else:
             sig[c] = pd.to_numeric(sig[c], errors="coerce")
-    # Delete any stale rows first, then re-insert
     with get_engine().connect() as con:
         con.execute(text("DELETE FROM signals WHERE session_id=:s"), {"s": sid})
         con.commit()
