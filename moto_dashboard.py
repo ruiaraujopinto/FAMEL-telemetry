@@ -368,29 +368,43 @@ def save_db(meta, df):
 
     eng = get_engine()
 
-    # Build INSERT dynamically — only use columns that exist in the live schema
+    # ── 1. Insert session row ─────────────────────────────────────────────────
     session_cols_db = _get_columns("sessions")
     wanted = ["name","date","rider","track","weather","notes","firmware","config",
               "ambient_temp","upload_time","row_count","duration_s","start_hms"]
-    # Ensure start_hms column exists (add it now if missing — before the INSERT)
     if "start_hms" not in session_cols_db:
         _ddl("ALTER TABLE sessions ADD COLUMN start_hms TEXT")
         session_cols_db.add("start_hms")
-
     insert_cols = [c for c in wanted if c in session_cols_db]
-    col_sql = ", ".join(insert_cols)
-    val_sql = ", ".join(f":{c}" for c in insert_cols)
-    # Strip keys from meta that aren't in insert_cols
+    col_sql  = ", ".join(insert_cols)
+    val_sql  = ", ".join(f":{c}" for c in insert_cols)
     meta_clean = {k: v for k, v in meta.items() if k in insert_cols}
 
     with eng.connect() as con:
-        r = con.execute(
-            text(f"INSERT INTO sessions({col_sql}) VALUES({val_sql}) RETURNING id"),
-            meta_clean)
-        sid = r.fetchone()[0]; con.commit()
+        r   = con.execute(text(f"INSERT INTO sessions({col_sql}) VALUES({val_sql}) RETURNING id"), meta_clean)
+        sid = r.fetchone()[0]
+        con.commit()
 
-    sig = df[sig_cols].copy(); sig.insert(0, "session_id", sid)
-    sig.to_sql("signals", eng, if_exists="append", index=False, method="multi", chunksize=2000)
+    # ── 2. Insert signals in small safe chunks (avoid PG 65535-param limit) ──
+    sig = df[sig_cols].copy()
+    sig.insert(0, "session_id", sid)
+
+    # Replace numpy NaN with None so psycopg2 sends NULL instead of NaN
+    sig = sig.where(pd.notna(sig), other=None)
+
+    all_cols   = ["session_id"] + sig_cols
+    col_sql_s  = ", ".join(all_cols)
+    val_sql_s  = ", ".join(f":{c}" for c in all_cols)
+    insert_sql = text(f"INSERT INTO signals({col_sql_s}) VALUES({val_sql_s})")
+
+    # 200 rows × 24 cols = 4800 params — well within PG 65535 limit
+    chunk = 200
+    rows = sig.to_dict(orient="records")
+    with eng.connect() as con:
+        for i in range(0, len(rows), chunk):
+            con.execute(insert_sql, rows[i:i+chunk])
+        con.commit()
+
     return sid
 
 # ── Derived metrics ───────────────────────────────────────────────────────────
