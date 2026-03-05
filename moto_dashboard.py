@@ -350,22 +350,46 @@ def parse_csv(raw):
             pd.to_numeric(df["brake"], errors="coerce"))
     return df, start_hms
 
+def _get_columns(table):
+    """Return the set of column names that actually exist in the live table."""
+    with get_engine().connect() as con:
+        res = con.execute(text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = :t"), {"t": table})
+        return {row[0] for row in res}
+
 def save_db(meta, df):
-    cols = ["t","throttle","speed_rpm","speed_kmh","brake","torque_nm",
-            "soc_bms1","soc_bms2","volt_mcu","volt_bms1","volt_bms2",
-            "curr_mcu","curr_bms1","curr_bms2","motor_temp","mcu_temp",
-            "board_temp_bms1","board_temp_bms2","mcu_errors","bms1_errors","bms2_errors","lat","lon"]
-    for c in cols:
+    sig_cols = ["t","throttle","speed_rpm","speed_kmh","brake","torque_nm",
+                "soc_bms1","soc_bms2","volt_mcu","volt_bms1","volt_bms2",
+                "curr_mcu","curr_bms1","curr_bms2","motor_temp","mcu_temp",
+                "board_temp_bms1","board_temp_bms2","mcu_errors","bms1_errors","bms2_errors","lat","lon"]
+    for c in sig_cols:
         if c not in df.columns: df[c] = np.nan
+
     eng = get_engine()
+
+    # Build INSERT dynamically — only use columns that exist in the live schema
+    session_cols_db = _get_columns("sessions")
+    wanted = ["name","date","rider","track","weather","notes","firmware","config",
+              "ambient_temp","upload_time","row_count","duration_s","start_hms"]
+    # Ensure start_hms column exists (add it now if missing — before the INSERT)
+    if "start_hms" not in session_cols_db:
+        _ddl("ALTER TABLE sessions ADD COLUMN start_hms TEXT")
+        session_cols_db.add("start_hms")
+
+    insert_cols = [c for c in wanted if c in session_cols_db]
+    col_sql = ", ".join(insert_cols)
+    val_sql = ", ".join(f":{c}" for c in insert_cols)
+    # Strip keys from meta that aren't in insert_cols
+    meta_clean = {k: v for k, v in meta.items() if k in insert_cols}
+
     with eng.connect() as con:
-        r = con.execute(text(
-            "INSERT INTO sessions(name,date,rider,track,weather,notes,firmware,config,"
-            "ambient_temp,upload_time,row_count,duration_s,start_hms) "
-            "VALUES(:name,:date,:rider,:track,:weather,:notes,:firmware,:config,"
-            ":ambient_temp,:upload_time,:row_count,:duration_s,:start_hms) RETURNING id"), meta)
+        r = con.execute(
+            text(f"INSERT INTO sessions({col_sql}) VALUES({val_sql}) RETURNING id"),
+            meta_clean)
         sid = r.fetchone()[0]; con.commit()
-    sig = df[cols].copy(); sig.insert(0,"session_id",sid)
+
+    sig = df[sig_cols].copy(); sig.insert(0, "session_id", sid)
     sig.to_sql("signals", eng, if_exists="append", index=False, method="multi", chunksize=2000)
     return sid
 
