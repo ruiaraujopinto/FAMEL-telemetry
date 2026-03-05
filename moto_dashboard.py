@@ -213,31 +213,37 @@ def plt(overrides=None):
 def get_engine():
     return create_engine(st.secrets["DATABASE_URL"], pool_pre_ping=True)
 
+def _ddl(sql):
+    """Each DDL in its own connection+transaction.
+    A 'column already exists' error never poisons other statements."""
+    try:
+        with get_engine().connect() as con:
+            con.execute(text(sql))
+            con.commit()
+    except Exception:
+        pass
+
 def init_db():
-    with get_engine().connect() as con:
-        con.execute(text("""CREATE TABLE IF NOT EXISTS sessions (
-            id SERIAL PRIMARY KEY, name TEXT NOT NULL, date TEXT, rider TEXT, track TEXT,
-            weather TEXT, notes TEXT, firmware TEXT, config TEXT, ambient_temp REAL,
-            upload_time TEXT, row_count INTEGER, duration_s REAL, start_hms TEXT)"""))
-        try: con.execute(text("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS start_hms TEXT"))
-        except: pass
-        con.execute(text("""CREATE TABLE IF NOT EXISTS signals (
-            session_id INTEGER, t REAL,
-            throttle REAL, speed_rpm REAL, speed_kmh REAL, brake REAL, torque_nm REAL,
-            soc_bms1 REAL, soc_bms2 REAL, volt_mcu REAL, volt_bms1 REAL, volt_bms2 REAL,
-            curr_mcu REAL, curr_bms1 REAL, curr_bms2 REAL,
-            motor_temp REAL, mcu_temp REAL, board_temp_bms1 REAL, board_temp_bms2 REAL,
-            mcu_errors TEXT, bms1_errors TEXT, bms2_errors TEXT, lat REAL, lon REAL)"""))
-        con.execute(text("CREATE INDEX IF NOT EXISTS idx_sig ON signals(session_id)"))
-        con.execute(text("""CREATE TABLE IF NOT EXISTS annotations (
-            id SERIAL PRIMARY KEY, session_id INTEGER, t REAL,
-            lat REAL, lon REAL,
-            label TEXT, severity TEXT, author TEXT, note TEXT, created_at TEXT)"""))
-        try: con.execute(text("ALTER TABLE annotations ADD COLUMN IF NOT EXISTS lat REAL"))
-        except: pass
-        try: con.execute(text("ALTER TABLE annotations ADD COLUMN IF NOT EXISTS lon REAL"))
-        except: pass
-        con.commit()
+    _ddl("""CREATE TABLE IF NOT EXISTS sessions (
+        id SERIAL PRIMARY KEY, name TEXT NOT NULL, date TEXT, rider TEXT, track TEXT,
+        weather TEXT, notes TEXT, firmware TEXT, config TEXT, ambient_temp REAL,
+        upload_time TEXT, row_count INTEGER, duration_s REAL, start_hms TEXT)""")
+    _ddl("""CREATE TABLE IF NOT EXISTS signals (
+        session_id INTEGER, t REAL,
+        throttle REAL, speed_rpm REAL, speed_kmh REAL, brake REAL, torque_nm REAL,
+        soc_bms1 REAL, soc_bms2 REAL, volt_mcu REAL, volt_bms1 REAL, volt_bms2 REAL,
+        curr_mcu REAL, curr_bms1 REAL, curr_bms2 REAL,
+        motor_temp REAL, mcu_temp REAL, board_temp_bms1 REAL, board_temp_bms2 REAL,
+        mcu_errors TEXT, bms1_errors TEXT, bms2_errors TEXT, lat REAL, lon REAL)""")
+    _ddl("CREATE INDEX IF NOT EXISTS idx_sig ON signals(session_id)")
+    _ddl("""CREATE TABLE IF NOT EXISTS annotations (
+        id SERIAL PRIMARY KEY, session_id INTEGER, t REAL,
+        lat REAL, lon REAL,
+        label TEXT, severity TEXT, author TEXT, note TEXT, created_at TEXT)""")
+    # Column migrations — each isolated so "already exists" never aborts others
+    _ddl("ALTER TABLE sessions    ADD COLUMN IF NOT EXISTS start_hms TEXT")
+    _ddl("ALTER TABLE annotations ADD COLUMN IF NOT EXISTS lat REAL")
+    _ddl("ALTER TABLE annotations ADD COLUMN IF NOT EXISTS lon REAL")
 
 try: init_db()
 except Exception as e: st.error(f"DB: {e}"); st.stop()
