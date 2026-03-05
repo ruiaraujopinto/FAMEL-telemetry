@@ -361,16 +361,16 @@ def _get_columns(table):
         return {row[0] for row in res}
 
 def save_db(meta, df):
-    sig_cols = ["t","throttle","speed_rpm","speed_kmh","brake","torque_nm",
+    SIG_COLS = ["t","throttle","speed_rpm","speed_kmh","brake","torque_nm",
                 "soc_bms1","soc_bms2","volt_mcu","volt_bms1","volt_bms2",
                 "curr_mcu","curr_bms1","curr_bms2","motor_temp","mcu_temp",
                 "board_temp_bms1","board_temp_bms2","mcu_errors","bms1_errors","bms2_errors","lat","lon"]
-    for c in sig_cols:
+    for c in SIG_COLS:
         if c not in df.columns: df[c] = np.nan
 
     eng = get_engine()
 
-    # ── 1. Insert session row ─────────────────────────────────────────────────
+    # ── 1. Insert session row (dynamic — only columns that exist in live DB) ──
     session_cols_db = _get_columns("sessions")
     wanted = ["name","date","rider","track","weather","notes","firmware","config",
               "ambient_temp","upload_time","row_count","duration_s","start_hms"]
@@ -387,25 +387,20 @@ def save_db(meta, df):
         sid = r.fetchone()[0]
         con.commit()
 
-    # ── 2. Insert signals in small safe chunks (avoid PG 65535-param limit) ──
-    sig = df[sig_cols].copy()
+    # ── 2. Insert signals via pandas to_sql (executemany — no param-count limit) ──
+    sig = df[SIG_COLS].copy()
     sig.insert(0, "session_id", sid)
 
-    # Replace numpy NaN with None so psycopg2 sends NULL instead of NaN
-    sig = sig.where(pd.notna(sig), other=None)
+    # Cast all numeric columns to native Python float so psycopg2 handles NULL correctly
+    for c in sig.columns:
+        if c in ("mcu_errors","bms1_errors","bms2_errors"):
+            sig[c] = sig[c].astype(str).where(sig[c].notna(), other=None)
+        else:
+            sig[c] = pd.to_numeric(sig[c], errors="coerce")
 
-    all_cols   = ["session_id"] + sig_cols
-    col_sql_s  = ", ".join(all_cols)
-    val_sql_s  = ", ".join(f":{c}" for c in all_cols)
-    insert_sql = text(f"INSERT INTO signals({col_sql_s}) VALUES({val_sql_s})")
-
-    # 200 rows × 24 cols = 4800 params — well within PG 65535 limit
-    chunk = 200
-    rows = sig.to_dict(orient="records")
-    with eng.connect() as con:
-        for i in range(0, len(rows), chunk):
-            con.execute(insert_sql, rows[i:i+chunk])
-        con.commit()
+    # to_sql without method="multi" → DBAPI executemany: one row at a time,
+    # zero parameter-count issues, works on every Postgres/Supabase setup.
+    sig.to_sql("signals", eng, if_exists="append", index=False, chunksize=500)
 
     return sid
 
@@ -1216,6 +1211,27 @@ def tab_ai(df, start_hms, srow, thr):
 # ═══════════════════════════════════════════════════════════════════════════════
 # STATIC PAGES
 # ═══════════════════════════════════════════════════════════════════════════════
+def _repair_signals(sid, df):
+    """Write signals for an existing session that has 0 rows (re-upload repair)."""
+    SIG_COLS = ["t","throttle","speed_rpm","speed_kmh","brake","torque_nm",
+                "soc_bms1","soc_bms2","volt_mcu","volt_bms1","volt_bms2",
+                "curr_mcu","curr_bms1","curr_bms2","motor_temp","mcu_temp",
+                "board_temp_bms1","board_temp_bms2","mcu_errors","bms1_errors","bms2_errors","lat","lon"]
+    for c in SIG_COLS:
+        if c not in df.columns: df[c] = np.nan
+    sig = df[SIG_COLS].copy()
+    sig.insert(0, "session_id", sid)
+    for c in sig.columns:
+        if c in ("mcu_errors","bms1_errors","bms2_errors"):
+            sig[c] = sig[c].astype(str).where(sig[c].notna(), other=None)
+        else:
+            sig[c] = pd.to_numeric(sig[c], errors="coerce")
+    # Delete any stale rows first, then re-insert
+    with get_engine().connect() as con:
+        con.execute(text("DELETE FROM signals WHERE session_id=:s"), {"s": sid})
+        con.commit()
+    sig.to_sql("signals", get_engine(), if_exists="append", index=False, chunksize=500)
+
 def page_upload():
     shdr("NEW TEST SESSION")
     with st.form("upload_form"):
@@ -1236,22 +1252,45 @@ def page_upload():
         if f is None: st.error("Select a CSV file."); return
         with st.spinner("Parsing and uploading…"):
             try:
-                df, start_hms = parse_csv(f.read())
+                raw_bytes = f.read()
+                df, start_hms = parse_csv(raw_bytes)
                 df = derive(df)
                 dur = float(df["t"].max()) if df["t"].notna().any() else 0.0
-                sid = save_db(dict(name=name,date=str(date),rider=rider,track=track,weather=weather,
-                    notes=notes,firmware=firmware,config=config,ambient_temp=float(ambient_t),
-                    upload_time=datetime.now().isoformat(),row_count=len(df),
-                    duration_s=dur,start_hms=start_hms), df)
-                bust()
-                # Verify rows actually landed
-                with get_engine().connect() as con:
-                    res = con.execute(text("SELECT COUNT(*) FROM signals WHERE session_id=:s"), {"s": sid})
-                    actual_rows = res.fetchone()[0]
-                if actual_rows == 0:
-                    st.error(f"❌ Upload failed: 0 rows written to database for session ID {sid}. Check the CSV format and try again.")
+
+                # Check if a session with this exact name already exists (repair mode)
+                existing = load_sessions()
+                match = existing[existing["name"] == name] if not existing.empty else pd.DataFrame()
+
+                if not match.empty:
+                    sid = int(match.iloc[0]["id"])
+                    with get_engine().connect() as con:
+                        res = con.execute(text("SELECT COUNT(*) FROM signals WHERE session_id=:s"), {"s": sid})
+                        existing_rows = res.fetchone()[0]
+                    if existing_rows == 0:
+                        # Repair: session exists but has no signals — re-ingest
+                        _repair_signals(sid, df)
+                        bust()
+                        with get_engine().connect() as con:
+                            res = con.execute(text("SELECT COUNT(*) FROM signals WHERE session_id=:s"), {"s": sid})
+                            actual_rows = res.fetchone()[0]
+                        st.success(f"🔧 **Repaired '{name}'** — wrote {actual_rows:,} signal rows to existing session ID {sid}")
+                    else:
+                        st.info(f"ℹ️ Session **'{name}'** already exists with {existing_rows:,} rows. Rename to create a new entry, or delete the old session first.")
+                    bust()
                 else:
-                    st.success(f"✅ **'{name}'** saved · {actual_rows:,} rows · {dur:.0f}s ({dur/60:.1f} min) · Start {start_hms}")
+                    # New session
+                    sid = save_db(dict(name=name,date=str(date),rider=rider,track=track,weather=weather,
+                        notes=notes,firmware=firmware,config=config,ambient_temp=float(ambient_t),
+                        upload_time=datetime.now().isoformat(),row_count=len(df),
+                        duration_s=dur,start_hms=start_hms), df)
+                    bust()
+                    with get_engine().connect() as con:
+                        res = con.execute(text("SELECT COUNT(*) FROM signals WHERE session_id=:s"), {"s": sid})
+                        actual_rows = res.fetchone()[0]
+                    if actual_rows == 0:
+                        st.error(f"❌ Upload failed silently — 0 rows in DB for session ID {sid}. Try again; if the problem persists contact support.")
+                    else:
+                        st.success(f"✅ **'{name}'** saved — {actual_rows:,} rows · {dur:.0f}s ({dur/60:.1f} min) · Start {start_hms}")
             except Exception as e:
                 st.error(f"❌ Upload error: {e}")
 
@@ -1264,6 +1303,21 @@ def page_sessions():
     c2.metric("Test time", f'{sess["duration_s"].sum()/3600:.1f} h')
     c3.metric("Data rows", f'{sess["row_count"].sum():,}')
     c4.metric("Riders", sess["rider"].nunique())
+
+    # Show broken sessions (0 rows in signals) with a repair prompt
+    broken = []
+    for _,r in sess.iterrows():
+        with get_engine().connect() as con:
+            res = con.execute(text("SELECT COUNT(*) FROM signals WHERE session_id=:s"), {"s": int(r["id"])})
+            n = res.fetchone()[0]
+        if n == 0:
+            broken.append((int(r["id"]), r["name"]))
+    if broken:
+        st.warning(
+            f"⚠️ **{len(broken)} session(s) have no signal data** (uploaded before a bug fix): "
+            + ", ".join(f"*{name}*" for _,name in broken)
+            + "\n\nTo fix: go to **Upload**, use the **exact same session name**, and re-upload the CSV. "
+            "The system will automatically repair the missing data.")
     st.divider()
     for _,r in sess.iterrows():
         dur = r["duration_s"]
