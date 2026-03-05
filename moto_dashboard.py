@@ -552,8 +552,8 @@ def tab_overview(df, start_hms, thr):
     dur_s = float(df["t"].max())
     spd   = num(df,"speed_kmh")
     moving = spd > 2
-    dist_km = df.get("dist_km", pd.Series([np.nan]))
-    dist_val = dist_km.max() if "dist_km" in df.columns else np.nan
+    dist_km_val = float(num(df,"dist_km").max()) if "dist_km" in df.columns else np.nan
+    dist_val = dist_km_val
     avg_spd_moving = spd[moving].mean() if moving.sum()>0 else np.nan
     wh_out   = df["wh_out"].max()   if "wh_out"   in df.columns else np.nan
     wh_regen = df["wh_regen"].max() if "wh_regen" in df.columns else np.nan
@@ -608,12 +608,61 @@ def tab_overview(df, start_hms, thr):
     if "wh_out" in df.columns:
         shdr("ENERGY TIMELINE")
         ep = make_subplots(rows=1,cols=1)
-        ep.add_trace(go.Scatter(x=wc_arr(sub["t"],start_hms), y=sub.get("wh_out",pd.Series()),
+        ep.add_trace(go.Scatter(x=wc_arr(sub["t"],start_hms),
+            y=num(sub,"wh_out") if "wh_out" in sub.columns else pd.Series(dtype=float),
             line=dict(color=C[0],width=1.5), name="Energy used (Wh)", fill="tozeroy", fillcolor="rgba(247,147,26,0.15)"))
-        ep.add_trace(go.Scatter(x=wc_arr(sub["t"],start_hms), y=sub.get("wh_regen",pd.Series()),
+        ep.add_trace(go.Scatter(x=wc_arr(sub["t"],start_hms),
+            y=num(sub,"wh_regen") if "wh_regen" in sub.columns else pd.Series(dtype=float),
             line=dict(color=C[2],width=1.5), name="Regen (Wh)", fill="tozeroy", fillcolor="rgba(63,185,80,0.15)"))
         ep.update_layout(**plt({"height":220, "xaxis":dict(gridcolor="#21262d",tickformat="%H:%M:%S"), "yaxis_title":"Wh"}))
         st.plotly_chart(ep, use_container_width=True, config=SCROLLZOOM)
+
+    # ── Custom signal explorer ────────────────────────────────────────────────
+    shdr("SIGNAL EXPLORER — CUSTOM CHANNEL SELECTION")
+    CHANNEL_GROUPS_OV = {
+        "🌡️ Temperatures":  ["motor_temp","mcu_temp","board_temp_bms1","board_temp_bms2"],
+        "🔋 Battery":        ["soc_bms1","soc_bms2","volt_mcu","volt_bms1","volt_bms2"],
+        "⚡ Current":        ["curr_mcu","curr_bms1","curr_bms2"],
+        "🏍️ Performance":   ["speed_kmh","speed_rpm","throttle","torque_nm","brake"],
+        "⚡ Derived":        ["power_kw","energy_kwh","wh_out","wh_regen","dist_km","mech_kw"],
+    }
+    avail_ov = [k for k in list(CHANNELS.keys()) + ["power_kw","wh_out","wh_regen","dist_km","mech_kw"]
+                if k in df.columns and num(df,k).notna().sum() > 10]
+    ex1, ex2 = st.columns([3,1])
+    with ex2:
+        st.markdown("**Quick groups**")
+        grp_sel = []
+        for grp_name, grp_chs in CHANNEL_GROUPS_OV.items():
+            if st.checkbox(grp_name, key=f"ov_grp_{grp_name}"):
+                grp_sel += [c for c in grp_chs if c in avail_ov]
+    with ex1:
+        default_ov = [c for c in ["motor_temp","soc_bms1","speed_kmh","curr_mcu"] if c in avail_ov]
+        sel_ov = st.multiselect(
+            "Channels", avail_ov,
+            grp_sel if grp_sel else default_ov,
+            format_func=lambda x: CHANNELS.get(x, x.replace("_"," ").title()),
+            key="ov_ch_sel")
+        if sel_ov:
+            t_ov0, t_ov1 = time_slider(df, start_hms, key="ov_explorer_slider")
+            sub_ov = ds(df[(df["t"]>=t_ov0)&(df["t"]<=t_ov1)])
+            xs_ov  = wc_arr(sub_ov["t"], start_hms)
+            fig_ex = go.Figure()
+            for i, ch in enumerate(sel_ov):
+                s = num(sub_ov, ch)
+                if s.isna().all(): continue
+                fig_ex.add_trace(go.Scatter(
+                    x=xs_ov, y=s, name=CHANNELS.get(ch, ch),
+                    line=dict(color=C[i % len(C)], width=1.5),
+                    hovertemplate=f"<b>{CHANNELS.get(ch,ch)}</b> %{{x|%H:%M:%S}} → %{{y:.2f}}<extra></extra>"))
+                if ch in thr:
+                    fig_ex.add_hline(y=thr[ch]["warn"], line_dash="dot", line_color="orange", opacity=0.45,
+                                     annotation_text="warn", annotation_font_color="orange")
+                    fig_ex.add_hline(y=thr[ch]["crit"], line_dash="dash", line_color="#ff4444", opacity=0.45,
+                                     annotation_text="crit", annotation_font_color="#ff4444")
+            fig_ex.update_layout(**plt({"height":360,
+                "xaxis": dict(gridcolor="#21262d", tickformat="%H:%M:%S"),
+                "yaxis_title": "Value"}))
+            st.plotly_chart(fig_ex, use_container_width=True, config=SCROLLZOOM)
 
 
 def tab_powertrain(df, start_hms, thr):
@@ -691,7 +740,7 @@ def tab_powertrain(df, start_hms, thr):
                 color=cv2 if cv2 is not None else C[0],
                 colorscale="RdYlGn_r" if cv2 is not None else None,
                 showscale=cv2 is not None,
-                colorbar=dict(title=c_title,thickness=10,titlefont=dict(size=9)) if cv2 is not None else None),
+                colorbar=dict(title=dict(text=c_title,font=dict(size=9)),thickness=10) if cv2 is not None else None),
             hovertemplate=f'{CHANNELS.get(x_ch,x_ch)}: %{{x:.1f}}<br>{CHANNELS.get(y_ch,y_ch)}: %{{y:.1f}}<extra></extra>'))
         fig.update_layout(**plt({"height":270,"title":dict(text=title,font=dict(size=11,color="#8b949e")),
             "xaxis_title":CHANNELS.get(x_ch,x_ch),"yaxis_title":CHANNELS.get(y_ch,y_ch)}))
@@ -750,9 +799,12 @@ def tab_battery(df, start_hms, thr):
         fig.add_trace(go.Scatter(x=xs, y=num(sub,"soc_bms1"), line=dict(color=C[0],width=1.5), name="SOC BMS1 (%)"))
         fig.add_trace(go.Scatter(x=xs, y=num(sub,"soc_bms2"), line=dict(color=C[1],width=1.5), name="SOC BMS2 (%)"))
         s1,s2 = num(sub,"soc_bms1"),num(sub,"soc_bms2")
-        fig.add_trace(go.Scatter(x=xs+xs[::-1],
-            y=pd.concat([s1,s2[::-1].reset_index(drop=True)]).tolist(),
-            fill="toself", fillcolor="rgba(255,107,107,0.12)", line_color="rgba(0,0,0,0)", name="Imbalance zone"))
+        # Shaded imbalance band between the two SOC lines
+        fig.add_trace(go.Scatter(
+            x=xs + list(reversed(xs)),
+            y=s1.tolist() + s2[::-1].reset_index(drop=True).tolist(),
+            fill="toself", fillcolor="rgba(255,107,107,0.12)",
+            line=dict(color="rgba(0,0,0,0)"), showlegend=False, name="Imbalance zone"))
         if "soc_bms1" in thr:
             fig.add_hline(y=thr["soc_bms1"]["warn"],line_dash="dot",line_color="orange",opacity=0.5)
         fig.update_layout(**plt({"height":280,"title":dict(text="SOC Comparison BMS1 vs BMS2",font=dict(size=12,color="#8b949e")),
@@ -796,7 +848,7 @@ def tab_battery(df, start_hms, thr):
                 x=num(sdf2,"curr_mcu"), y=num(sdf2,"volt_mcu"), mode="markers",
                 marker=dict(size=3, color=num(sdf2,"motor_temp") if "motor_temp" in sdf2.columns else C[0],
                     colorscale="RdYlGn_r", showscale=True, opacity=0.65,
-                    colorbar=dict(title="Motor°C",thickness=10,titlefont=dict(size=9))),
+                    colorbar=dict(title=dict(text="Motor°C",font=dict(size=9)),thickness=10)),
                 hovertemplate="I: %{x:.1f}A  V: %{y:.2f}V<extra></extra>"))
             fig4.update_layout(**plt({"height":280,"title":dict(text="Voltage Sag — V vs I  (colour = Motor Temp)",font=dict(size=12,color="#8b949e")),
                 "xaxis_title":"Current MCU (A)","yaxis_title":"Voltage MCU (V)"}))
@@ -868,7 +920,7 @@ def tab_thermal(df, start_hms, thr):
                 mode="markers",
                 marker=dict(size=3, color=num(sdf2,"speed_kmh"), colorscale="Viridis",
                     showscale=True, opacity=0.6,
-                    colorbar=dict(title="Speed km/h",thickness=10,titlefont=dict(size=9))),
+                    colorbar=dict(title=dict(text="Speed km/h",font=dict(size=9)),thickness=10)),
                 hovertemplate="Power: %{x:.2f}kW<br>dT/dt: %{y:.3f}°C/s<extra></extra>"))
             fig2.update_layout(**plt({"height":320,"title":dict(text="Motor Temp Rise Rate vs Power  (colour=Speed)",font=dict(size=12,color="#8b949e")),
                 "xaxis_title":"Power (kW)","yaxis_title":"Motor dT/dt (°C/s)"}))
@@ -982,10 +1034,13 @@ def tab_faults(df, start_hms, thr):
             fig_ctx.add_trace(go.Scatter(x=ctx_xs, y=num(ctx_df,ch), name=CHANNELS.get(ch,ch), line=dict(color=c,width=1.3)), row=3,col=1)
         for ch,c in [("motor_temp",C[0]),("mcu_temp",C[1]),("board_temp_bms1",C[2]),("board_temp_bms2",C[3])]:
             fig_ctx.add_trace(go.Scatter(x=ctx_xs, y=num(ctx_df,ch), name=CHANNELS.get(ch,ch), line=dict(color=c,width=1.3)), row=4,col=1)
-        # Mark fault center
+        # Mark fault center on all subplots
         fault_wc = to_wc(t_center, start_hms)
         for r in range(1,5):
-            fig_ctx.add_vline(x=fault_wc, line_color="#ff4444", line_dash="dash", opacity=0.7, row=r, col=1)
+            fig_ctx.add_shape(type="line",
+                x0=fault_wc, x1=fault_wc, y0=0, y1=1,
+                xref=f"x{'' if r==1 else r}", yref="paper",
+                line=dict(color="#ff4444", dash="dash", width=1.5), opacity=0.7)
         fig_ctx.update_layout(**plt({"height":580,
             "title":dict(text=f'Context ±15s around: {sel_fault["Fault"]}',font=dict(size=12,color="#8b949e"))}))
         for r in range(1,5):
