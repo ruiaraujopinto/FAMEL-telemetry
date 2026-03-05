@@ -495,12 +495,19 @@ def threshold_events(df, thr):
 
 # ── Slider ────────────────────────────────────────────────────────────────────
 def time_slider(df, start_hms, key):
-    t_max = float(df["t"].max())
-    origin = datetime(2000,1,1) + timedelta(seconds=hms_to_s(start_hms))
-    sel = st.slider("Time window", min_value=origin,
-        max_value=origin+timedelta(seconds=t_max),
-        value=(origin, origin+timedelta(seconds=t_max)),
-        step=timedelta(seconds=1), format="HH:mm:ss", key=key)
+    t_raw = df["t"].max()
+    t_max = float(t_raw) if pd.notna(t_raw) and float(t_raw) > 1 else 60.0
+    try:
+        origin = datetime(2000,1,1) + timedelta(seconds=hms_to_s(start_hms))
+    except Exception:
+        origin = datetime(2000,1,1)
+    end = origin + timedelta(seconds=t_max)
+    # Slider requires min < max
+    if end <= origin:
+        end = origin + timedelta(seconds=60)
+    sel = st.slider("Time window", min_value=origin, max_value=end,
+        value=(origin, end), step=timedelta(seconds=1),
+        format="HH:mm:ss", key=key)
     return (sel[0]-origin).total_seconds(), (sel[1]-origin).total_seconds()
 
 # ── Gauge ─────────────────────────────────────────────────────────────────────
@@ -1258,7 +1265,11 @@ def page_analyse(thr):
     label = st.selectbox("Select session", list(opts.keys()))
     sid, srow = opts[label]
     df = derive(load_signals(sid))
-    start_hms = str(srow.get("start_hms") or "00:00:00")
+    if df.empty or "t" not in df.columns:
+        st.warning("No signal data found for this session. It may have been uploaded with an incompatible CSV format.")
+        return
+    raw_hms = srow.get("start_hms")
+    start_hms = str(raw_hms) if raw_hms and str(raw_hms) not in ("nan","None","") else "00:00:00"
 
     tabs = st.tabs(["📊 Overview","⚙️ Powertrain","🔋 Battery","🌡️ Thermal","🔴 Faults","🗺️ Route","🤖 AI"])
     with tabs[0]: tab_overview(df, start_hms, thr)
